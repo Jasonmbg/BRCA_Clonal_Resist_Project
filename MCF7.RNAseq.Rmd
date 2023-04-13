@@ -1,0 +1,240 @@
+---
+title: "Breast cancer clonal resistance-RNAseq analysis example"
+author: "Efstathios-Iason Vlachavas"
+date: "2023-03-31"
+output: html_document
+---
+
+```{r message = FALSE, warning=FALSE}
+
+library(tidyverse)
+library(limma)
+library(decoupleR)
+library(org.Hs.eg.db)
+library(ggplot2)
+library(forcats)
+library(clusterProfiler)
+library(DOSE)
+library(msigdbr)
+library(clusterProfiler)
+library(enrichplot)
+library(progeny)
+
+load("MCF7_DGE_Processed_31032023.RData") # raw counts using the Rsubread-featureCounts pipeline
+
+```
+
+Initial pre-processing/quality assessment/differential expression analysis
+
+```{r message = FALSE, warning=FALSE}
+
+biol.group <- y$samples$Condition
+
+keep.exprs <- filterByExpr(y, group=biol.group)
+
+y.filt <- y[keep.exprs,, keep.lib.sizes=FALSE] # 14339 genes with removing the one sample
+
+dge <- calcNormFactors(y.filt, method = "TMM")
+
+par(mfrow=c(1,2))
+lcpm <- cpm(y, log=TRUE)
+
+boxplot(lcpm, las=2, col="red", main="")
+title(main="A: Unnormalised data",ylab="Log-cpm")
+
+lcpm <- cpm(dge, log=TRUE)
+boxplot(lcpm, las=2, col="blue", main="")
+title(main="B: Normalised data",ylab="Log-cpm")
+
+Biol_barcode <- dge$samples$Condition
+
+par(mfrow=c(1,1))
+
+lcpm <- cpm(dge, log=TRUE)
+plotMDS(lcpm, labels=Biol_barcode, col=as.numeric(Biol_barcode)) 
+
+######################################################################################
+# proceed to the actual gene expression analysis
+
+group <- as.factor(dge$samples$Condition)
+
+design1 <- model.matrix(~0 + group)
+colnames(design1) <- gsub("group", "", colnames(design1))
+
+y <- voom(dge, design1, plot = T)
+
+voom.fit <- lmFit(y, design1)
+
+
+# 4 important biological comparisons
+cm <- makeContrasts(Comp1= WT -TAMR_A, 
+Comp2= WT - LTED_E, 
+Comp3= WT - LTED_B_1,
+Comp4= WT - LTED_B_2,
+levels = colnames(coef(voom.fit)))
+fit2 <- contrasts.fit(voom.fit, cm)
+fit3 <- eBayes(fit2, trend=TRUE,robust = TRUE)
+
+```
+
+Exploratory Data Analysis (EDA) Heatmaps of most variable genes
+
+```{r message = FALSE, warning=FALSE}
+
+library(circlize)
+library(ComplexHeatmap)
+
+norm.voom.mat <- y$E
+rownames(norm.voom.mat) <- as.character(y$genes$SYMBOL)
+pheno.dat <- y$targets
+pheno.dat.sel <- pheno.dat[,c(1,4)]
+pdat2 <- pheno.dat.sel %>% dplyr::select(Condition)
+
+mad.vars <- apply(norm.voom.mat,1,mad)
+madorder <- order(mad.vars,decreasing=T)[1:200]
+mad.mat <- norm.voom.mat[madorder,]
+
+scaled_mat = t(scale(t(mad.mat)))
+
+col_fun_2 = colorRamp2(c(-2, 0, 2), c("#000080", "white", "#AA0000"), space = "RGB")
+
+ha = HeatmapAnnotation(
+    Condition= pdat2[[1]],
+    col = list(Condition = structure(names = c("LTED_B_1","LTED_B_2","LTED_E","TAMR_A","WT"), 
+    c("#690030", "#CE4869", "#FB0306", "#26009E", "#D3D3D3"))))
+
+
+Heatmap(scaled_mat, name="Scaled_gene_expression", 
+row_names_gp = gpar(fontsize = 9), top_annotation = ha,show_column_names = FALSE, col=col_fun_2, show_row_names = F, column_dend_reorder = T, column_split = 5)
+
+
+```
+
+Customized GSEA approach [MSigDB hallmarks]
+
+```{r message = FALSE, warning=FALSE, fig.height=8, fig.width=12}
+
+m_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>% 
+dplyr::select(gs_name, entrez_gene)
+
+comp1_stat <- limma::topTable(fit3, coef=1, number=nrow(fit3), adjust.method="fdr", sort.by="none") %>% rownames_to_column() %>% dplyr::select(SYMBOL,t)
+
+comp1.genes <- as.character(comp1_stat$SYMBOL)
+
+eg.comp1 <- bitr(comp1.genes, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db") # drops also NA values mapping
+
+table(duplicated(eg.comp1$SYMBOL)) # 3
+table(duplicated(eg.comp1$ENTREZID)) # 0
+
+eg.comp2 <- eg.comp1[!duplicated(eg.comp1$SYMBOL),]
+
+merged.de.dat <- inner_join(comp1_stat, eg.comp2, by="SYMBOL")
+merged.de.dat <- merged.de.dat %>% arrange(desc(t))
+
+gsea.stats <- merged.de.dat$t
+names(gsea.stats) <- merged.de.dat$ENTREZID
+
+fgsea.out <- GSEA(gsea.stats, TERM2GENE = m_t2g, pvalueCutoff = 1) # ordered ranked gene list
+
+fgsea.out_dt <- fgsea.out[]
+
+gseaplot2(fgsea.out, geneSetID = 22, title = fgsea.out$Description[22], pvalue_table = T) # example illustrating a specific hallmark {"HALLMARK_UNFOLDED_PROTEIN_RESPONSE"}
+
+```
+
+Estimation of differential pathway activities
+
+```{r message = FALSE, warning=FALSE}
+
+# Utilize all the t-stats for the aformentioned comparisons to compute differentially activated pathways based on NES scores; for more information regarding PROGENy see here: (https://doi.org/10.1038/s41467-017-02391-6)
+
+comp1_stat <- limma::topTable(fit3, coef=1, number=nrow(fit3), adjust.method="fdr", sort.by="none") %>% rownames_to_column() %>% dplyr::select(SYMBOL,t) %>% column_to_rownames("SYMBOL") %>% rename(WT_vsTAMR_A_stat=t)
+
+
+total_stat_dat <- comp1_stat %>% as.matrix()
+
+PathwayActivity_zscore <- progeny(total_stat_dat, 
+    scale=TRUE, organism="Human", top = 100, perm = 10000, z_scores = TRUE) %>%
+    t()
+colnames(PathwayActivity_zscore) <- c("NES_WT_vsTAMR_A")
+
+#################### For NES_WT_vsTAMR_A ##############################################
+
+# construct a plot visualizing the top pathway altered activities
+
+PathwayActivity_zscore_df <- as.data.frame(PathwayActivity_zscore) %>% 
+    rownames_to_column(var = "Pathway")
+
+ewp2 <- arrange(PathwayActivity_zscore_df, desc(abs(NES_WT_vsTAMR_A))) %>%
+group_by(sign(NES_WT_vsTAMR_A)) %>%
+slice(1:4)
+
+ggplot(ewp2, showCategory=8,
+aes(NES_WT_vsTAMR_A, fct_reorder(Pathway, NES_WT_vsTAMR_A), fill=NES_WT_vsTAMR_A)) +
+geom_col() +
+scale_fill_gradient2(low = "darkblue", high = "indianred", mid = "whitesmoke", midpoint = 0,
+guide=guide_colorbar(reverse=FALSE)) +
+theme_dose(14) +
+xlab("Normalized Enrichment Score") +
+ylab(NULL) +
+ggtitle("PROGENy_Pathways")
+
+```
+
+Inference of relative differential Transcriptional Factor activities
+
+```{r message = FALSE, warning=FALSE}
+
+################################ TF ACTIVITY ANALYSIS ################################
+
+# Perform TF activity analysis from the rnaseq data
+# continue utilizing the computated differential t-stats from above:
+
+comp1_stat <- limma::topTable(fit3, coef=1, number=nrow(fit3), adjust.method="fdr", sort.by="none") %>% rownames_to_column() %>% dplyr::select(SYMBOL,t) %>% column_to_rownames("SYMBOL") %>% rename(WT_vsTAMR_A_stat=t)
+
+library(dorothea)
+library(decoupleR)
+
+#Firstly we import the dorothea regulons (using only confidence A, B, and C), see dorothea publication for information on confidence levels and respective database (https://doi.org/10.1101/gr.240663.118)
+
+dorothea_df <- as.data.frame(dorothea_hs[dorothea_hs$confidence %in% c("A","B","C"),c(3,1,4)])
+dorothea_df$likelihood <- 1
+
+dorothea_df <- intersect_regulons(as.matrix(comp1_stat), dorothea_df, .source = tf, .target = target, minsize=20) # as we have the same genes in all comparisons, we simply use one of them to define a cutoff of keeping TFs with at least 20 target genes expressed/present in our expression matrix
+
+# Now we estimate the TF activities using the *weighted mean* metric from decoupleR:
+# For more details for the available metrics check here: https://saezlab.github.io/decoupleR/articles/decoupleR.html#methods
+
+TF_activities_WT_vsTAMR_A <- as.data.frame(run_wmean(mat = as.matrix(comp1_stat), network = dorothea_df, .source = "tf", .target = "target", times = 1000))
+
+TF_activities_WT_vsTAMR_A_plot_dat <- TF_activities_WT_vsTAMR_A[TF_activities_WT_vsTAMR_A$statistic == "norm_wmean",c(2,4,5)]  %>% as_tibble() %>% rename("Dorothea_TFs"="source")
+
+x3 <- arrange(TF_activities_WT_vsTAMR_A_plot_dat, desc(score)) %>%
+dplyr::slice(1:10)
+
+# Only for the top-10 most relatively activated TFs in the tamoxifen resistant samples:
+
+ggplot(x3, showCategory = 10,
+aes(score,
+fct_reorder(Dorothea_TFs, abs(score)))) +
+geom_segment(aes(xend=0, yend = Dorothea_TFs)) +
+geom_point(aes(color=p_value, size = abs(score))) +
+scale_color_gradientn(colours=c("#f7ca64", "#46bac2",
+"#7e62a3"),
+trans = "log10",
+guide=guide_colorbar(reverse=TRUE,
+order=1)) +
+scale_size_continuous(range=c(2, 10)) +
+theme_dose(12) +
+xlab("Normalized Enrichment Score") +
+ylab(NULL) + 
+ggtitle("DoRothEA TF Activities")
+
+```
+
+
+
+
+
+
+

@@ -1,0 +1,147 @@
+---
+title: "Breast cancer clonal resistance-Phosphoproteomics analysis reproducible example"
+author: "Efstathios-Iason Vlachavas"
+date: "2023-04-03"
+output: html_document
+---
+
+
+```{r message = FALSE, warning=FALSE}
+
+library(tidyverse)
+library(PhosR)
+library(limma)
+library(OmnipathR)
+library(decoupleR)
+library(vsn)
+library(ggplot2)
+
+load("MCF7_Phospho_PreProcess_Raw_PPE_03042023.RData") # briefly, the object container includes raw phosphoproteomics intensities derived from a data independent acquisition workflow (DIA, Spectronaut-Perseus pipeline/localization cut-off at 0.95)
+
+```
+
+Initial pre-processing 
+
+```{r message = FALSE, warning=FALSE, fig.height=8, fig.width=12}
+
+quant.phospho.mat <- SummarizedExperiment::assay(ppe, "Quantification")
+
+
+fit <- vsnMatrix(quant.phospho.mat)
+meanSdPlot(fit)
+mat.norm <- vsn::predict(fit,quant.phospho.mat)
+
+SummarizedExperiment::assay(ppe, "Normalization") = mat.norm # to add a further assay of the normalized intensity values
+
+grps <-ppe@colData$Condition # 5 conditions after the updated removal
+ppe <- selectGrps(ppe, grps, 0.75, 1) # if the quantification rate within that condition is equal to or greater than a desired percentage (such as least in 2 or 3 samples as we have triplicates in each condition-so to keep phosphosites that are "present" in at least 1 condhttp://127.0.0.1:44855/graphics/plot_zoom_png?width=1280&height=658ition)
+
+plotQC(ppe@assays@data$Quantification, labels=colnames(ppe),
+        panel = "quantify", grps = grps)
+
+plotQC(ppe@assays@data$Normalization, 
+       labels=colnames(ppe), 
+       panel = "dendrogram", grps = grps) +
+  ggplot2::ggtitle("Hierarchical dendrogram after VSN normalization") # height 600
+
+plotQC(SummarizedExperiment::assay(ppe,"Normalization"), 
+            grps = SummarizedExperiment::colData(ppe)$Condition, 
+            labels = colnames(ppe), 
+            panel="pca") +
+  ggplot2::ggtitle("Principal Component Analysis after VSN normalization")
+
+
+```
+
+Differential abundance analysis
+
+```{r message = FALSE, warning=FALSE}
+
+cond.cell <- as.factor(ppe@colData$Condition)
+
+design <- model.matrix(~ 0 + cond.cell)
+colnames(design) <- gsub("cond.cell", "", colnames(design))
+
+# fit linear model for each phosphosite
+fit <- lmFit(ppe@assays@data$Normalization, design)
+
+
+# formulate comparisons of interest
+contrast.matrix <- makeContrasts(Comp1= WT - TAMR_A,
+Comp2= WT - LTED_B_1, 
+Comp3= WT - LTED_B_2,
+Comp4= WT - LTED_E,
+levels=design) 
+
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit3 <- eBayes(fit2,trend = TRUE, robust = TRUE)
+
+# For simplicity, here we will show only results related to one specific comparison of interest:
+# ------------------------------------ WT vs TAMR_A -----------------------------------------
+
+comp1_stat <- limma::topTable(fit3, coef=1, number=nrow(fit3), adjust.method="fdr", sort.by="none") %>% dplyr::select(t) %>% 
+rename(WT_vs_TAMR_A_t_value=t) %>% drop_na() %>% 
+rownames_to_column() %>% separate("rowname", sep=";", into=c("UniprotID","GeneSymbol",
+"SR","FR")) %>% unite("Final.Feature", c("GeneSymbol","SR"), sep="_",remove = FALSE) %>%
+select(Final.Feature, WT_vs_TAMR_A_t_value) %>% dplyr::distinct(Final.Feature,.keep_all=TRUE) %>% column_to_rownames("Final.Feature")
+
+```
+
+Estimation of relative differential kinase activities
+
+```{r message = FALSE, warning=FALSE}
+
+#inport KSN from omnipath
+omnipath_ptm <- get_signed_ptms()
+
+# [*General comment*]: As all databases, the resources constituting OmniPath contain wrong records, some of them more, others less. Here we noticed some erroneous records from one resource called ProtMapper. ProtMapper uses literature mining algorithms (REACH, Sparser), which are known to produce a number of false positives in their output.Hence, we continued by removing the interactions having only ProtMapper as annotation resource from our data frame:
+
+omnipath_ptm <- omnipath_ptm %>% filter(!grepl('ProtMapper', sources) | n_resources > 1) # Which means: not from ProtMapper, or from more than one resource (i.e. if it is from ProtMapper, but also another resource confirms, then we keep the record).
+
+omnipath_ptm <- omnipath_ptm[omnipath_ptm$modification %in% c("dephosphorylation","phosphorylation"),]
+KSN <- omnipath_ptm[,c(4,3)]
+KSN$substrate_genesymbol <- paste(KSN$substrate_genesymbol,omnipath_ptm$residue_type, sep ="_")
+KSN$substrate_genesymbol <- paste(KSN$substrate_genesymbol,omnipath_ptm$residue_offset, sep = "")
+KSN$mor <- ifelse(omnipath_ptm$modification == "phosphorylation", 1, -1)
+KSN$likelihood <- 1
+
+#we remove ambiguous modes of regulations
+KSN$id <- paste(KSN$substrate_genesymbol,KSN$enzyme_genesymbol,sep ="")
+KSN <- KSN[!duplicated(KSN$id),]
+KSN <- KSN[,-5]
+
+#rename KSN to fit decoupler format
+names(KSN)[c(1,2)] <- c("phospho_site","kinase")
+
+KSN_exp_WT_vs_TAMR_A <- intersect_regulons(as.matrix(comp1_stat), KSN, .source = kinase, .target = phospho_site, minsize=5)
+
+# then compute the relative kinase activities
+
+kin_activity_WT_vs_TAMR_A <- run_wmean(mat = as.matrix(comp1_stat), .source = "kinase", .target = "phospho_site",network = KSN_exp_WT_vs_TAMR_A, times = 1000)
+kin_activity_WT_vs_TAMR_A <- kin_activity_WT_vs_TAMR_A[kin_activity_WT_vs_TAMR_A$statistic == "norm_wmean",c(2,4)]
+
+Kinase_zscore_df <- as.data.frame(kin_activity_WT_vs_TAMR_A) %>%
+    dplyr::arrange(score) %>%
+    dplyr::mutate(Omnipath_kinases = factor(source)) %>% select(-source) %>%
+    dplyr::filter(abs(score)>=3)
+
+ggplot(Kinase_zscore_df,aes(x = reorder(Omnipath_kinases, score), 
+    y = score)) + 
+    geom_bar(aes(fill = score), stat = "identity") +
+    scale_fill_gradient2(low = "darkblue", high = "indianred", 
+        mid = "whitesmoke", midpoint = 0) + 
+    theme_minimal() +
+    theme(axis.title = element_text(face = "bold", size = 12),
+        axis.text.x = 
+            element_text(angle = 45, hjust = 1, size =10, face= "bold"),
+        axis.text.y = element_text(size =10, face= "bold"),
+        panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+    xlab("Omnipath_kinases")
+
+
+```
+
+
+
+
